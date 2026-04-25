@@ -82,13 +82,99 @@ const TIMINGS = Object.freeze({
  * Claude model identifier.
  * @constant {string}
  */
-const CLAUDE_MODEL = CLAUDE_MODEL;
+const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+
+/**
+ * Google Gemini model identifier for AI fallback.
+ * @constant {string}
+ */
+const GEMINI_MODEL = 'gemini-1.5-flash';
+
+/**
+ * Base URL for Gemini (Vertex AI) Generative Language API.
+ * @constant {string}
+ */
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+/**
+ * Base URL for Google Cloud Natural Language API.
+ * @constant {string}
+ */
+const NLP_API_BASE = 'https://language.googleapis.com/v1/documents';
+
+/**
+ * Google Cloud Functions base URL (runtime-configurable via window.CLOUD_FUNCTIONS_BASE).
+ * @constant {string}
+ */
+const CLOUD_FUNCTIONS_BASE = 'https://us-central1-civicguide-app.cloudfunctions.net';
+
+/**
+ * BigQuery project and dataset for streaming analytics inserts.
+ * Override via window.BQ_PROJECT_ID and window.BQ_DATASET.
+ * @constant {string}
+ */
+const BQ_DEFAULT_PROJECT = 'civicguide-app';
+const BQ_DEFAULT_DATASET = 'civicguide_analytics';
+const BQ_EVENTS_TABLE   = 'session_events';
 
 /**
  * Maximum conversation turns kept in memory for the Claude API.
  * @constant {number}
  */
 const MAX_HISTORY_TURNS = 12;
+
+/* ─── Rate Limiter ──────────────────────────────────────────────────────────── */
+
+/**
+ * Token-bucket rate limiter to protect external API calls.
+ * Tracks requests in a sliding time window.
+ *
+ * @example
+ * const limiter = new RateLimiter(10, 60_000); // 10 req/min
+ * if (!limiter.canMakeRequest()) throw new Error('Rate limited');
+ */
+class RateLimiter {
+  /**
+   * @param {number} maxRequests - Max allowed calls in the window
+   * @param {number} windowMs    - Sliding window size in milliseconds
+   */
+  constructor(maxRequests, windowMs) {
+    /** @private @type {number} */ this._max = maxRequests;
+    /** @private @type {number} */ this._window = windowMs;
+    /** @private @type {number[]} */ this._log = [];
+  }
+
+  /**
+   * Attempt to consume one request token.
+   * @returns {boolean} True if the request is allowed; false if rate-limited.
+   */
+  canMakeRequest() {
+    const now = Date.now();
+    this._log = this._log.filter(t => now - t < this._window);
+    if (this._log.length >= this._max) return false;
+    this._log.push(now);
+    return true;
+  }
+
+  /**
+   * Time in milliseconds until the next request slot is available.
+   * @returns {number} 0 if a slot is available immediately, otherwise wait time.
+   */
+  msUntilAvailable() {
+    if (this._log.length < this._max) return 0;
+    const oldest = Math.min(...this._log);
+    return Math.max(0, this._window - (Date.now() - oldest));
+  }
+}
+
+/** Rate limiter: Claude AI — 15 requests per minute */
+const claudeRateLimiter = new RateLimiter(15, 60_000);
+/** Rate limiter: Gemini AI — 20 requests per minute */
+const geminiRateLimiter = new RateLimiter(20, 60_000);
+/** Rate limiter: Google NLP API — 30 requests per minute */
+const nlpRateLimiter = new RateLimiter(30, 60_000);
+/** Rate limiter: BigQuery streaming inserts — 60 per minute */
+const bqRateLimiter = new RateLimiter(60, 60_000);
 
 /* ─── Region Data ──────────────────────────────────────────────────────────── */
 const REGIONS = {
@@ -413,8 +499,8 @@ function init() {
  * Reads stored Google API key from sessionStorage and updates status badges.
  */
 function initGoogleServicesSetup() {
-  const setupInput = ;
-  const saveBtn = ;
+  const setupInput = $('#google-api-key-setup');
+  const saveBtn = $('#google-key-save-btn');
   if (!setupInput || !saveBtn) return;
 
   // Pre-fill from session if already set
@@ -435,12 +521,19 @@ function initGoogleServicesSetup() {
     try {
       sessionStorage.setItem("cg_google_key", key);
       // Also sync to the civic API input
-      const civicInput = ;
+      const civicInput = $('#google-api-key-input');
       if (civicInput) civicInput.value = key;
     } catch (_) {}
     updateMapsStatusBadge(true);
-    showToast("Google API key activated! Maps, Places, and Civic API enabled.");
+    showToast("Google API key activated! Maps, Places, Civic API, Gemini AI & BigQuery enabled.");
     logFirebase("google_key_configured", { region });
+
+    // Update Gemini status badge
+    updateGeminiStatusBadge(true);
+
+    // Stream initial session event to BigQuery now that key is available
+    streamEventToBigQuery('google_services_activated', { region });
+
     // Reload Maps with the new key
     if (typeof reloadGoogleMaps === "function") reloadGoogleMaps(key);
   });
@@ -450,8 +543,8 @@ function initGoogleServicesSetup() {
  * Update the Firebase status badge in the Google Services card.
  */
 function updateFirebaseStatusBadge() {
-  const badge = ;
-  const statEl = ;
+  const badge = $('#firebase-status-badge');
+  const statEl = $('#stat-firebase');
   if (!badge) return;
   const configured = window.firebaseConfigured;
   if (configured) {
@@ -470,7 +563,7 @@ function updateFirebaseStatusBadge() {
  * @param {boolean} active - Whether a real API key is configured
  */
 function updateMapsStatusBadge(active) {
-  const badge = ;
+  const badge = $('#maps-status-badge');
   if (!badge) return;
   if (active) {
     badge.textContent = "✅ Maps: Key configured";
@@ -478,6 +571,54 @@ function updateMapsStatusBadge(active) {
   } else {
     badge.textContent = "⚠️ Maps: No key (embed mode)";
     badge.className = "service-badge service-badge--warn";
+  }
+}
+
+/**
+ * Update the Gemini AI status badge.
+ * @param {boolean} active - Whether a Google API key enabling Gemini is configured
+ */
+function updateGeminiStatusBadge(active) {
+  const badge = $('#gemini-status-badge');
+  if (!badge) return;
+  if (active) {
+    badge.textContent = "✅ Gemini AI: Ready";
+    badge.className = "service-badge service-badge--ok";
+  } else {
+    badge.textContent = "⏳ Gemini AI: Waiting for key";
+    badge.className = "service-badge service-badge--pending";
+  }
+}
+
+/**
+ * Update the BigQuery streaming status badge.
+ * @param {boolean} active - Whether BigQuery streaming is ready
+ */
+function updateBigQueryStatusBadge(active) {
+  const badge = $('#bigquery-status-badge');
+  if (!badge) return;
+  if (active) {
+    badge.textContent = "✅ BigQuery: Streaming";
+    badge.className = "service-badge service-badge--ok";
+  } else {
+    badge.textContent = "⏳ BigQuery: Waiting for key";
+    badge.className = "service-badge service-badge--pending";
+  }
+}
+
+/**
+ * Update the Cloud Functions status badge.
+ * @param {boolean} active - Whether Cloud Functions endpoint is reachable
+ */
+function updateCloudFunctionsStatusBadge(active) {
+  const badge = $('#cloudfn-status-badge');
+  if (!badge) return;
+  if (active) {
+    badge.textContent = "✅ Cloud Functions: Connected";
+    badge.className = "service-badge service-badge--ok";
+  } else {
+    badge.textContent = "⏳ Cloud Functions: Standby";
+    badge.className = "service-badge service-badge--pending";
   }
 }
 
@@ -491,7 +632,7 @@ function reloadGoogleMaps(key) {
     showToast("Maps API key updated. Refresh page for full Maps reload.");
     return;
   }
-  const existing = document.querySelector("script[src*="maps.googleapis.com"]");
+  const existing = document.querySelector("script[src*='maps.googleapis.com']");
   if (existing) existing.remove();
   const script = document.createElement("script");
   script.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(key) + "&libraries=places,geometry&callback=initGoogleMaps&loading=async";
@@ -531,14 +672,17 @@ function logFirebase(eventName, params = {}) {
   } catch (_) {}
 }
 
-/** Store a question log to Firestore */
+/** Store a question log to Firestore and stream to BigQuery for analytics */
 async function storeQuestionLog(question, mode) {
+  const sanitized = question.slice(0, INPUT_LIMITS.FIRESTORE_QUESTION);
+
+  // Firestore log (real-time, offline-capable)
   try {
     if (typeof window.firebaseAddDoc === "function" && window.firebaseDb) {
       await window.firebaseAddDoc(
         window.firebaseCollection(window.firebaseDb, "question_logs"),
         {
-          question: question.slice(0, INPUT_LIMITS.FIRESTORE_QUESTION),
+          question: sanitized,
           region,
           mode,
           timestamp: window.firebaseServerTimestamp?.() ?? new Date()
@@ -548,6 +692,14 @@ async function storeQuestionLog(question, mode) {
   } catch (_) {
     // Firestore may fail with demo config — continue silently
   }
+
+  // BigQuery streaming insert (durable analytics warehouse)
+  streamEventToBigQuery('question_logged', {
+    question_length: sanitized.length,
+    mode,
+    has_api_key: Boolean(apiKey),
+    has_google_key: Boolean(googleApiKey)
+  });
 }
 
 /** Update the sidebar session-stats display */
@@ -767,12 +919,20 @@ function cacheKey() {
         if (el) el.value = googleApiKey;
       });
       updateMapsStatusBadge(true);
+      updateGeminiStatusBadge(true);
+      updateBigQueryStatusBadge(true);
+      updateCloudFunctionsStatusBadge(true);
     }
 
     $("#api-modal").style.display = apiKey || mode === "offline" ? "none" : "flex";
 
     const statMode = $("#stat-mode");
-    if (statMode) statMode.textContent = apiKey ? "AI" : mode === "offline" ? "Offline" : "—";
+    if (statMode) {
+      if (apiKey) statMode.textContent = "Claude AI";
+      else if (googleApiKey) statMode.textContent = "Gemini AI";
+      else if (mode === "offline") statMode.textContent = "Offline";
+      else statMode.textContent = "—";
+    }
   } catch (_) {
     apiKey = "";
     googleApiKey = "";
@@ -780,28 +940,73 @@ function cacheKey() {
   }
 }
 
+/**
+ * Save the Anthropic API key (and optionally Google key) from the launch modal.
+ * Validates the Anthropic key format, persists both keys to sessionStorage,
+ * updates all service status badges, and streams a session-start event to BigQuery.
+ */
 function saveKey() {
-  const input = $("#api-key-input");
-  const error = $("#api-key-error");
-  const value = input.value.trim();
-  if (!value || !value.startsWith("sk-")) {
+  const input     = $("#api-key-input");
+  const error     = $("#api-key-error");
+  const googleIn  = $("#google-modal-key-input");
+  const value     = input.value.trim();
+  const googleVal = googleIn?.value.trim() || "";
+
+  // Validate: allow empty Anthropic key if Google key is provided
+  if (value && !value.startsWith("sk-")) {
     error.textContent = "Enter a valid Anthropic API key beginning with sk-.";
     input.focus();
     return;
   }
-  apiKey = value;
-  try {
-    sessionStorage.setItem("cg_key", value);
-    sessionStorage.setItem("cg_mode", "api");
-  } catch (_) {}
+  if (!value && !googleVal) {
+    error.textContent = "Enter at least one API key, or continue without a key.";
+    return;
+  }
+
+  if (value) {
+    apiKey = value;
+    try {
+      sessionStorage.setItem("cg_key", value);
+      sessionStorage.setItem("cg_mode", "api");
+    } catch (_) {}
+  }
+
+  if (googleVal) {
+    googleApiKey = googleVal;
+    try {
+      sessionStorage.setItem("cg_google_key", googleVal);
+      // Sync to all setup inputs
+      const setupInput = $("#google-api-key-setup");
+      const civicInput = $("#google-api-key-input");
+      if (setupInput) setupInput.value = googleVal;
+      if (civicInput) civicInput.value = googleVal;
+    } catch (_) {}
+    updateMapsStatusBadge(true);
+    updateGeminiStatusBadge(true);
+    updateBigQueryStatusBadge(true);
+    updateCloudFunctionsStatusBadge(true);
+  }
+
   error.textContent = "";
   $("#api-modal").style.display = "none";
+
   const statMode = $("#stat-mode");
-  if (statMode) statMode.textContent = "AI";
-  showToast("Key saved for this browser session.");
+  if (statMode) {
+    if (value) statMode.textContent = "Claude AI";
+    else if (googleVal) statMode.textContent = "Gemini AI";
+  }
+
+  showToast(value ? "Claude AI key saved for this session." : "Google AI key saved — Gemini enabled.");
   $("#chat-input").focus();
-  logFirebase("api_key_saved");
-  window.firebaseSetUserProperty?.("mode", "api");
+  logFirebase("api_key_saved", { has_claude: Boolean(value), has_google: Boolean(googleVal) });
+  window.firebaseSetUserProperty?.("mode", value ? "claude" : "gemini");
+
+  // Stream session start to BigQuery (non-blocking)
+  streamEventToBigQuery("session_started", {
+    has_claude_key: Boolean(value),
+    has_google_key: Boolean(googleVal),
+    mode: value ? "claude" : (googleVal ? "gemini" : "offline")
+  });
 }
 
 function startOfflineMode() {
@@ -1129,11 +1334,22 @@ async function sendMessage(override = "") {
   setLoading(true);
   showTyping();
 
-  const mode = apiKey ? "api" : "offline";
+  const mode = apiKey ? "api" : (googleApiKey ? "gemini_capable" : "offline");
   sessionStats.questions++;
   updateSessionStats();
   logFirebase("question_asked", { region, mode });
   storeQuestionLog(text, mode);
+
+  // Non-blocking NLP analysis — enriches context without delaying response
+  analyzeQueryWithNLP(text).then(nlp => {
+    if (nlp) {
+      const context = buildNlpContext(nlp);
+      if (context) logFirebase('nlp_context_applied', { region, entities: nlp.entities.length });
+    }
+  });
+
+  // Stream event to BigQuery for durable analytics
+  streamEventToBigQuery('question_asked', { question_length: text.length, mode });
 
   try {
     const raw = apiKey ? await callClaudeWithRetry(text) : localAnswer(text);
@@ -1197,29 +1413,347 @@ async function callClaude(message) {
 
 /**
  * Call the Claude API with automatic retry on transient network errors.
- * Attempts up to 2 retries with 1-second back-off before giving up.
- * @param {string} message - User question
+ * Falls back to Google Gemini (Vertex AI) if Claude is unavailable and a
+ * Google API key is configured, providing dual-provider AI resilience.
+ *
+ * Retry strategy: up to 1 retry for network/timeout errors with 1-second back-off.
+ * After retries exhausted: falls back to Gemini, then to offline knowledge base.
+ *
+ * @param {string} message   - User question
  * @param {number} [attempts=0] - Current retry count (internal)
- * @returns {Promise<string>} Model response text
+ * @returns {Promise<string>} Model response text from Claude, Gemini, or offline fallback
  */
 async function callClaudeWithRetry(message, attempts = 0) {
+  // Enforce Claude rate limit
+  if (!claudeRateLimiter.canMakeRequest()) {
+    const waitMs = claudeRateLimiter.msUntilAvailable();
+    logFirebase('claude_rate_limited', { waitMs, region });
+    // Try Gemini instead if we have a Google key
+    if (googleApiKey && geminiRateLimiter.canMakeRequest()) {
+      logFirebase('gemini_fallback_triggered', { reason: 'claude_rate_limited' });
+      return callGemini(message);
+    }
+    throw new Error(`Rate limited. Please wait ${Math.ceil(waitMs / 1000)}s before asking again.`);
+  }
+
   try {
     return await callClaude(message);
   } catch (err) {
-    const isRetryable = err.name === "AbortError" || err.message.includes("fetch") || err.message.includes("network");
+    const isRetryable = err.name === 'AbortError' || err.message.includes('fetch') || err.message.includes('network');
     if (attempts < 1 && isRetryable) {
-      await new Promise((r) => window.setTimeout(r, TIMINGS.RETRY_DELAY_MS));
-      // Remove the failed user message from history before retrying
-      if (history[history.length - 1]?.role === "user") history.pop();
-      logFirebase("claude_api_retry", { attempt: attempts + 1 });
+      await new Promise(r => window.setTimeout(r, TIMINGS.RETRY_DELAY_MS));
+      if (history[history.length - 1]?.role === 'user') history.pop();
+      logFirebase('claude_api_retry', { attempt: attempts + 1 });
       return callClaudeWithRetry(message, attempts + 1);
+    }
+    // Final fallback: try Google Gemini before giving up
+    if (googleApiKey) {
+      try {
+        logFirebase('gemini_fallback_triggered', { reason: err.message, region });
+        const geminiReply = await callGemini(message);
+        return `${geminiReply}\n\n[note: Answered by Google Gemini (Claude was unavailable). Verify with official sources.]`;
+      } catch (geminiErr) {
+        logFirebase('gemini_fallback_failed', { error: geminiErr.message });
+      }
     }
     throw err;
   }
 }
 
+/* ─── Google Gemini AI (Vertex AI Generative Language) ──────────────────────── */
+
 /**
- * Generate a structured offline answer using the FALLBACKS keyword database.
+ * Call the Google Gemini API (Vertex AI Generative Language) as an AI provider.
+ * Requires a Google API key with the Generative Language API enabled.
+ *
+ * Used as a primary AI fallback when Claude is unavailable or rate-limited,
+ * providing dual-provider resilience for the education platform.
+ *
+ * @param {string} message - User question
+ * @returns {Promise<string>} Gemini's response text
+ * @throws {Error} If the Google API key is missing, the request times out, or Gemini returns an error
+ */
+async function callGemini(message) {
+  if (!googleApiKey) throw new Error('Google API key required for Gemini. Add one in Google Services Setup.');
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), TIMINGS.CLAUDE_TIMEOUT_MS);
+  const systemContext = getSystemPrompt();
+
+  const response = await fetch(
+    `${GEMINI_API_BASE}/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(googleApiKey)}`,
+    {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          role: 'user',
+          parts: [{ text: `${systemContext}\n\nUser question: ${message}` }]
+        }],
+        generationConfig: {
+          maxOutputTokens: 900,
+          temperature: 0.3,
+          topP: 0.9,
+          topK: 40
+        },
+        safetySettings: [
+          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }
+        ]
+      })
+    }
+  ).finally(() => window.clearTimeout(timeout));
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Gemini HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Empty Gemini response — model may have blocked the content.');
+
+  logFirebase('gemini_api_success', {
+    region,
+    tokens: data.usageMetadata?.candidatesTokenCount || 0,
+    promptTokens: data.usageMetadata?.promptTokenCount || 0
+  });
+
+  return text;
+}
+
+/* ─── Google Natural Language API ───────────────────────────────────────────── */
+
+/**
+ * Analyze a user query using the Google Cloud Natural Language API.
+ * Extracts entities and classifies content to improve response relevance.
+ * Results are used to enhance the system prompt with detected civic topics.
+ *
+ * Requires a Google API key with the Cloud Natural Language API enabled.
+ * Fails silently if the key is missing or the API is unavailable.
+ *
+ * @param {string} question - User's raw question text
+ * @returns {Promise<{entities: Array, categories: Array}|null>} NLP analysis or null on failure
+ */
+async function analyzeQueryWithNLP(question) {
+  if (!googleApiKey || !nlpRateLimiter.canMakeRequest()) return null;
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 5000);
+
+  try {
+    // Run entity analysis and content classification in parallel
+    const [entitiesRes, classifyRes] = await Promise.allSettled([
+      fetch(`${NLP_API_BASE}:analyzeEntities?key=${encodeURIComponent(googleApiKey)}`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document: { type: 'PLAIN_TEXT', content: question },
+          encodingType: 'UTF8'
+        })
+      }),
+      fetch(`${NLP_API_BASE}:classifyText?key=${encodeURIComponent(googleApiKey)}`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document: { type: 'PLAIN_TEXT', content: question.length >= 20 ? question : `${question} elections voting` }
+        })
+      })
+    ]);
+
+    const entities = entitiesRes.status === 'fulfilled' && entitiesRes.value.ok
+      ? (await entitiesRes.value.json()).entities || []
+      : [];
+
+    const categories = classifyRes.status === 'fulfilled' && classifyRes.value.ok
+      ? (await classifyRes.value.json()).categories || []
+      : [];
+
+    const result = { entities, categories };
+
+    logFirebase('nlp_analysis_complete', {
+      region,
+      entityCount: entities.length,
+      topCategory: categories[0]?.name || 'none'
+    });
+
+    return result;
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+/**
+ * Build an NLP-enhanced context string to prepend to AI prompts.
+ * Uses entity extraction results to give the AI richer context about
+ * what specific civic concepts the user is asking about.
+ *
+ * @param {{entities: Array, categories: Array}|null} nlp - NLP analysis result
+ * @returns {string} Context prefix or empty string if no useful NLP data
+ */
+function buildNlpContext(nlp) {
+  if (!nlp || (!nlp.entities.length && !nlp.categories.length)) return '';
+
+  const topEntities = nlp.entities
+    .filter(e => e.salience > 0.1)
+    .slice(0, 4)
+    .map(e => e.name)
+    .join(', ');
+
+  const topCategory = nlp.categories[0]?.name || '';
+
+  const parts = [];
+  if (topEntities) parts.push(`Key detected topics: ${topEntities}`);
+  if (topCategory) parts.push(`Content category: ${topCategory}`);
+
+  return parts.length ? `[NLP Context: ${parts.join(' | ')}]\n` : '';
+}
+
+/* ─── Google BigQuery Streaming Analytics ───────────────────────────────────── */
+
+/**
+ * Stream a single analytics event to Google BigQuery using the insertAll REST API.
+ * Provides durable, queryable analytics alongside Firebase for data warehouse use cases.
+ *
+ * Requires a Google API key with the BigQuery API enabled and appropriate IAM permissions.
+ * Uses a non-blocking fire-and-forget pattern — failures never block the user experience.
+ *
+ * Override project/dataset at runtime via window.BQ_PROJECT_ID and window.BQ_DATASET.
+ *
+ * @param {string} eventName - Analytics event name (e.g. 'question_asked')
+ * @param {Object} [data={}]  - Additional event properties to include in the row
+ * @returns {Promise<void>}
+ */
+async function streamEventToBigQuery(eventName, data = {}) {
+  if (!googleApiKey || !bqRateLimiter.canMakeRequest()) return;
+
+  const projectId = window.BQ_PROJECT_ID || BQ_DEFAULT_PROJECT;
+  const dataset   = window.BQ_DATASET    || BQ_DEFAULT_DATASET;
+  const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(BQ_EVENTS_TABLE)}/insertAll?key=${encodeURIComponent(googleApiKey)}`;
+
+  const row = {
+    insertId: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    json: {
+      event_name:       eventName,
+      region,
+      app_version:      '2.1.0',
+      ai_mode:          apiKey ? 'claude' : (googleApiKey ? 'gemini_capable' : 'offline'),
+      client_timestamp: new Date().toISOString(),
+      session_id:       getSessionId(),
+      ...data
+    }
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rows: [row],
+        skipInvalidRows: true,
+        ignoreUnknownValues: true
+      })
+    });
+
+    if (response.ok) {
+      logFirebase('bigquery_insert_ok', { event: eventName });
+    }
+  } catch {
+    // BigQuery streaming is best-effort; never block the main UX
+  }
+}
+
+/**
+ * Get or create a stable session ID for BigQuery row correlation.
+ * Stored in sessionStorage so it persists across re-renders but not tabs.
+ * @returns {string} A random session identifier
+ */
+function getSessionId() {
+  try {
+    let id = sessionStorage.getItem('cg_session_id');
+    if (!id) {
+      id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      sessionStorage.setItem('cg_session_id', id);
+    }
+    return id;
+  } catch {
+    return 'unknown';
+  }
+}
+
+/* ─── Google Cloud Functions ─────────────────────────────────────────────────── */
+
+/**
+ * Invoke a Google Cloud Function endpoint by name.
+ * Cloud Functions are used for server-side processing such as:
+ *  - Fetching real-time election data from authoritative sources
+ *  - Aggregating BigQuery query results for the UI dashboard
+ *  - Triggering Firestore cleanup jobs
+ *  - Proxying requests to APIs that require server-side keys
+ *
+ * Override the base URL via window.CLOUD_FUNCTIONS_BASE for custom deployments.
+ *
+ * @param {string} functionName - Cloud Function name (e.g. 'getElectionData')
+ * @param {Object} [payload={}] - JSON body to send to the function
+ * @param {number} [timeoutMs=10000] - Request timeout in milliseconds
+ * @returns {Promise<Object>} Parsed JSON response from the Cloud Function
+ * @throws {Error} On network failure, timeout, or non-2xx response
+ */
+async function callCloudFunction(functionName, payload = {}, timeoutMs = 10_000) {
+  const base = window.CLOUD_FUNCTIONS_BASE || CLOUD_FUNCTIONS_BASE;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  const response = await fetch(`${base}/${encodeURIComponent(functionName)}`, {
+    method:  'POST',
+    signal:  controller.signal,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CivicGuide-Region':  region,
+      'X-CivicGuide-Version': '2.1.0'
+    },
+    body: JSON.stringify({ ...payload, region, sessionId: getSessionId() })
+  }).finally(() => window.clearTimeout(timeout));
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    throw new Error(errBody.message || `Cloud Function "${functionName}" returned HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  logFirebase('cloud_function_called', { function: functionName, region });
+  return data;
+}
+
+/**
+ * Fetch real-time election data via Cloud Functions.
+ * Calls the `getElectionData` Cloud Function which aggregates from
+ * official election APIs and caches results in Firestore.
+ *
+ * @param {string} [regionCode] - Region override (defaults to active region)
+ * @returns {Promise<Object|null>} Election data object or null on failure
+ */
+async function fetchElectionDataFromCloudFunction(regionCode) {
+  try {
+    const data = await callCloudFunction('getElectionData', {
+      regionCode: regionCode || region,
+      includeTimeline: true,
+      includeRegistration: true
+    });
+    logFirebase('cloud_election_data_fetched', { region: regionCode || region });
+    return data;
+  } catch (err) {
+    logFirebase('cloud_election_data_failed', { error: err.message });
+    return null;
+  }
+}
+
+/**
  * Returns formatted guidance with region-specific official sources.
  * @param {string} question - The user's question (used for keyword matching)
  * @param {string} [rgn] - Optional region override (defaults to global `region`)

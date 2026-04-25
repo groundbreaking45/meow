@@ -3,6 +3,30 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Content Security Policy — restricts script/style/connect origins -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src  'self' 'unsafe-inline' https://translate.google.com https://maps.googleapis.com https://www.gstatic.com https://www.google.com https://generativelanguage.googleapis.com;
+    style-src   'self' 'unsafe-inline' https://fonts.googleapis.com;
+    font-src    https://fonts.gstatic.com;
+    connect-src 'self'
+                https://api.anthropic.com
+                https://generativelanguage.googleapis.com
+                https://language.googleapis.com
+                https://bigquery.googleapis.com
+                https://www.googleapis.com
+                https://maps.googleapis.com
+                https://firestore.googleapis.com
+                https://firebase.googleapis.com
+                https://www.gstatic.com
+                https://us-central1-civicguide-app.cloudfunctions.net;
+    img-src     'self' data: https: blob:;
+    frame-src   https://www.google.com https://translate.google.com;
+    worker-src  'self';
+    manifest-src 'self';
+  " />
+  <!-- Permissions Policy — restrict sensitive browser APIs -->
+  <meta http-equiv="Permissions-Policy" content="geolocation=(self), microphone=(), camera=(), payment=(), usb=(), serial=()" />
   <meta name="description" content="CivicGuide – AI-powered election education assistant. Understand voter registration, ballot counting, the Electoral College, and more." />
   <meta name="theme-color" content="#0D1B2A" />
   <meta name="referrer" content="strict-origin-when-cross-origin" />
@@ -136,10 +160,12 @@
         <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#C8902A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
       </div>
       <h2 id="modal-title">Choose Assistant Mode</h2>
-      <p id="modal-desc">Use CivicGuide instantly in offline education mode, or add an Anthropic API key for dynamic AI answers. Keys are kept only in this browser session.</p>
-      <label for="api-key-input">Anthropic API Key</label>
+      <p id="modal-desc">Use CivicGuide instantly in offline education mode, add an Anthropic API key for Claude AI, or add a Google API key to enable Gemini AI + Maps + BigQuery analytics. Keys are kept only in this browser session.</p>
+      <label for="api-key-input">Anthropic API Key <span style="font-size:0.8em;opacity:0.7">(for Claude AI)</span></label>
       <input type="password" id="api-key-input" placeholder="sk-ant-api03-…" aria-required="true" autocomplete="off" spellcheck="false" />
       <div id="api-key-error" role="alert" aria-live="assertive" class="field-error"></div>
+      <label for="google-modal-key-input" style="margin-top:10px;display:block">Google API Key <span style="font-size:0.8em;opacity:0.7">(for Gemini AI, Maps, BigQuery, NLP)</span></label>
+      <input type="password" id="google-modal-key-input" placeholder="AIza…" autocomplete="off" spellcheck="false" style="margin-bottom:4px" />
       <button class="btn-primary" id="save-key-btn">Launch CivicGuide →</button>
       <button class="btn-secondary" id="demo-mode-btn">Continue Without API Key</button>
       <p class="modal-foot">Stored in session only. <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer">Get a free key →</a></p>
@@ -249,7 +275,32 @@
           <div id="google-services-status" role="status" aria-live="polite" class="civic-api-result" style="margin-top:6px">
             <span id="firebase-status-badge" class="service-badge service-badge--pending">⏳ Firebase: Initializing…</span>
             <span id="maps-status-badge" class="service-badge service-badge--pending">⏳ Maps: Waiting for key</span>
+            <span id="gemini-status-badge" class="service-badge service-badge--pending">⏳ Gemini AI: Waiting for key</span>
+            <span id="bigquery-status-badge" class="service-badge service-badge--pending">⏳ BigQuery: Waiting for key</span>
+            <span id="cloudfn-status-badge" class="service-badge service-badge--pending">⏳ Cloud Functions: Standby</span>
           </div>
+          <!-- BigQuery project configuration -->
+          <details style="margin-top:8px">
+            <summary style="font-size:0.73rem;color:var(--text-muted);cursor:pointer">Advanced: BigQuery &amp; Cloud Functions</summary>
+            <div style="margin-top:6px">
+              <label for="bq-project-input" style="font-size:0.73rem">BigQuery Project ID</label>
+              <input id="bq-project-input" type="text" autocomplete="off" spellcheck="false" maxlength="80"
+                placeholder="civicguide-app" aria-label="Google Cloud project ID for BigQuery"
+                style="width:100%;padding:4px 8px;font-size:0.75rem;border-radius:6px;border:1px solid var(--border);background:var(--bg-deep);color:var(--text-main);margin-top:2px"
+                oninput="window.BQ_PROJECT_ID=this.value.trim()||'civicguide-app'" />
+              <label for="bq-dataset-input" style="font-size:0.73rem;margin-top:4px;display:block">BigQuery Dataset</label>
+              <input id="bq-dataset-input" type="text" autocomplete="off" spellcheck="false" maxlength="80"
+                placeholder="civicguide_analytics" aria-label="BigQuery dataset name"
+                style="width:100%;padding:4px 8px;font-size:0.75rem;border-radius:6px;border:1px solid var(--border);background:var(--bg-deep);color:var(--text-main);margin-top:2px"
+                oninput="window.BQ_DATASET=this.value.trim()||'civicguide_analytics'" />
+              <label for="cloudfn-base-input" style="font-size:0.73rem;margin-top:4px;display:block">Cloud Functions Base URL</label>
+              <input id="cloudfn-base-input" type="text" autocomplete="off" spellcheck="false" maxlength="200"
+                placeholder="https://us-central1-civicguide-app.cloudfunctions.net"
+                aria-label="Cloud Functions base URL"
+                style="width:100%;padding:4px 8px;font-size:0.75rem;border-radius:6px;border:1px solid var(--border);background:var(--bg-deep);color:var(--text-main);margin-top:2px"
+                oninput="window.CLOUD_FUNCTIONS_BASE=this.value.trim()" />
+            </div>
+          </details>
           <p style="font-size:0.73rem;color:var(--text-muted);margin-top:4px">
             <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer">Get a Google API key →</a>
           </p>
